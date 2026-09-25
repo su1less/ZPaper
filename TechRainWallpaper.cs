@@ -494,6 +494,8 @@ namespace TechRain
         }
         [DllImport("gdi32.dll")] public static extern IntPtr CreateDIBSection(IntPtr hdc, BITMAPINFO bmi, uint usage, out IntPtr bits, IntPtr hSection, uint offset);
         [DllImport("gdi32.dll")] public static extern bool BitBlt(IntPtr dst, int dx, int dy, int w, int h, IntPtr src, int sx, int sy, uint rop);
+        [DllImport("gdi32.dll")] public static extern bool StretchBlt(IntPtr dst, int dx, int dy, int dw, int dh, IntPtr src, int sx, int sy, int sw, int sh, uint rop);
+        [DllImport("gdi32.dll")] public static extern int SetStretchBltMode(IntPtr hdc, int mode);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetProcessWorkingSetSizeEx(IntPtr h, IntPtr min, IntPtr max, uint flags);
         [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr tok);
         [DllImport("advapi32.dll", SetLastError = true)] static extern bool LookupPrivilegeValue(string sys, string name, out long luid);
@@ -639,6 +641,11 @@ namespace TechRain
     {
         public int W, H, Theme;
         Bitmap bg;
+        // weak-machine particle throttle: RenderLoop lowers this when switching to
+        // half-res so the rain coverage follows the reduced pixel budget
+        public static float Quality = 1f;
+        public bool HalfRes;      // scene is being drawn into the half-size DIB
+        Bitmap halfBg;            // pre-scaled bg: avoids per-frame resampling of the full image
         // per-section frame-cost profile ([SCENE] log lines)
         static double ptBg, ptStars, ptHole, ptShoots;
         static int ptN;
@@ -1136,7 +1143,8 @@ namespace TechRain
         public void Draw(Graphics g)
         {
             double bg0 = Stopwatch.GetTimestamp();
-            g.DrawImage(bg, 0, 0);
+            if (HalfRes && halfBg != null) g.DrawImage(halfBg, 0, 0, W, H);
+            else g.DrawImage(bg, 0, 0);
             ptBg += (Stopwatch.GetTimestamp() - bg0) * 1000.0 / Stopwatch.Frequency;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             float wind = WindNow();
@@ -1459,8 +1467,12 @@ namespace TechRain
 
         void DrawRainLayer(Graphics g, int l, float wind)
         {
+            // rain streaks are thin fast-moving lines: anti-aliasing triples their
+            // rasterization cost for zero visual gain - turn it off around the layer
+            SmoothingMode sm = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.None;
             List<Drop> list = rain[l];
-            int active = (int)(list.Count * Math.Min(1f, 0.1f + Rain));
+            int active = (int)(list.Count * Math.Min(1f, 0.1f + Rain) * Quality);
             for (int i = 0; i < active; i++)
             {
                 Drop d = list[i];
@@ -1474,6 +1486,28 @@ namespace TechRain
                 if (snowMix > 0.02f)
                     g.FillEllipse(snowBrush, d.X - 1.5f, d.Y - 1.5f, 3f, 3f);
             }
+            g.SmoothingMode = sm;
+        }
+
+        // called by the render thread when the quality ladder switches to half-res:
+        // pre-scale the background once so per-frame draws are 1:1 sampled
+        public void SetHalfRes(bool on)
+        {
+            HalfRes = on;
+            if (!on) return;
+            try
+            {
+                if (halfBg == null)
+                {
+                    halfBg = new Bitmap(W / 2, H / 2, PixelFormat.Format32bppPArgb);
+                    using (Graphics g = Graphics.FromImage(halfBg))
+                    {
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(bg, 0, 0, W / 2, H / 2);
+                    }
+                }
+            }
+            catch { }
         }
 
         void DrawStars(Graphics g)
@@ -1528,6 +1562,13 @@ namespace TechRain
         // kernel GDI lock against the dock; the BitBlt is ~5ms.
         IntPtr dibDC = IntPtr.Zero, dibBmp = IntPtr.Zero, dibOld = IntPtr.Zero;
         Graphics dibG;
+        // half-resolution DIB: weak machines render the scene 4-5x slower than the
+        // dev box (75ms/frame measured); drawing at 0.5 scale cuts the pixel cost
+        // ~4x and StretchBlt upscales - the wallpaper reads the same at a glance
+        IntPtr dibHalfDC = IntPtr.Zero, dibHalfBmp = IntPtr.Zero, dibHalfOld = IntPtr.Zero;
+        Graphics dibHalfG;
+        volatile bool halfRes;
+        int scrW, scrH;
         Thread renderThread;
         volatile bool renderRun;
         bool staticPublished;
@@ -1558,16 +1599,32 @@ namespace TechRain
             IntPtr sdc = Program.GetDC(IntPtr.Zero);
             Program.BITMAPINFO bi = new Program.BITMAPINFO();
             bi.biWidth = b.Width;
-            bi.biHeight = -b.Height;   // top-down
+            bi.biHeight = -b.Height;
             IntPtr bits;
             dibBmp = Program.CreateDIBSection(sdc, bi, 0, out bits, IntPtr.Zero, 0);
             dibDC = Program.CreateCompatibleDC(sdc);
+            scrW = b.Width; scrH = b.Height;
+            Program.BITMAPINFO bh = new Program.BITMAPINFO();
+            bh.biWidth = b.Width / 2;
+            bh.biHeight = -(b.Height / 2);
+            IntPtr bitsH;
+            dibHalfBmp = Program.CreateDIBSection(sdc, bh, 0, out bitsH, IntPtr.Zero, 0);
+            dibHalfDC = Program.CreateCompatibleDC(sdc);
             Program.ReleaseDC(IntPtr.Zero, sdc);
             if (dibDC != IntPtr.Zero && dibBmp != IntPtr.Zero)
             {
                 dibOld = Program.SelectObject(dibDC, dibBmp);
                 dibG = Graphics.FromHdc(dibDC);
                 dibG.SmoothingMode = SmoothingMode.AntiAlias;
+            }
+            if (dibHalfDC != IntPtr.Zero && dibHalfBmp != IntPtr.Zero)
+            {
+                dibHalfOld = Program.SelectObject(dibHalfDC, dibHalfBmp);
+                dibHalfG = Graphics.FromHdc(dibHalfDC);
+                dibHalfG.SmoothingMode = SmoothingMode.AntiAlias;
+                // scene code draws in FULL-screen coordinates; this transform maps
+                // every draw call onto half the pixels
+                dibHalfG.ScaleTransform(0.5f, 0.5f);
             }
             renderRun = true;
             renderThread = new Thread(RenderLoop);
@@ -1827,11 +1884,15 @@ namespace TechRain
                     }
                     double t0 = rsw.Elapsed.TotalMilliseconds;
                     double updMs = 0;
+                    Graphics tg = halfRes ? dibHalfG : dibG;
                     try
                     {
-                        lock (AppShell.SceneLock) s.Update(dt);
-                        updMs = rsw.Elapsed.TotalMilliseconds - t0;
-                        lock (AppShell.SceneLock) s.Draw(dibG);
+                        if (tg != null)
+                        {
+                            lock (AppShell.SceneLock) s.Update(dt);
+                            updMs = rsw.Elapsed.TotalMilliseconds - t0;
+                            lock (AppShell.SceneLock) s.Draw(tg);
+                        }
                     }
                     catch { }
                     double t1 = rsw.Elapsed.TotalMilliseconds;
@@ -1842,13 +1903,20 @@ namespace TechRain
                     if (wallN >= 90)
                     {
                         double wallFrame = (wallDrawSum + wallPresentSum) / wallN;
-                        // weak-machine adaptation: stretch the wallpaper cycle so its
-                        // GDI duty cycle stays ~<=50% no matter how slow the renderer
-                        if (wallFrame > 30) wallCycle = 80;       // ~12fps
+                        // weak-machine adaptation ladder: 1) stretch the cycle, 2) drop
+                        // to half-res rendering, 3) thin the particles (Scene.Quality)
+                        if (wallFrame > 35 && !halfRes)
+                        {
+                            halfRes = true;
+                            Scene.Quality = 0.5f;
+                            s.SetHalfRes(true);
+                            Program.Log("[WALLR] frame cost " + wallFrame.ToString("F1") + "ms -> switching to HALF-RES rendering");
+                        }
+                        else if (wallFrame > 30) wallCycle = 80;       // ~12fps
                         else if (wallFrame > 20) wallCycle = 65;  // ~15fps
                         else wallCycle = 50;                      // 20fps
-                        Program.Log(string.Format("[WALLR] n={0} updAvg={1:F1}ms drawOnly={2:F1}ms presentAvg={3:F1}ms presentMax={4:F1}ms cycle={5}ms",
-                            wallN, wallUpdSum / wallN, (wallDrawSum - wallUpdSum) / wallN, wallPresentSum / wallN, wallPresentMax, wallCycle));
+                        Program.Log(string.Format("[WALLR] n={0} updAvg={1:F1}ms drawOnly={2:F1}ms presentAvg={3:F1}ms presentMax={4:F1}ms cycle={5}ms halfRes={6}",
+                            wallN, wallUpdSum / wallN, (wallDrawSum - wallUpdSum) / wallN, wallPresentSum / wallN, wallPresentMax, wallCycle, halfRes));
                         wallN = 0; wallDrawSum = 0; wallUpdSum = 0; wallPresentSum = 0; wallPresentMax = 0;
                     }
                 }
@@ -1890,10 +1958,21 @@ namespace TechRain
         {
             try
             {
-                if (!IsHandleCreated || dibDC == IntPtr.Zero) return;
+                if (!IsHandleCreated) return;
+                if (halfRes && dibHalfDC == IntPtr.Zero) return;
+                if (!halfRes && dibDC == IntPtr.Zero) return;
                 IntPtr dc = Program.GetDC(Handle);
                 if (dc == IntPtr.Zero) return;
-                try { Program.BitBlt(dc, 0, 0, Width, Height, dibDC, 0, 0, 0x00CC0020); }
+                try
+                {
+                    if (halfRes)
+                    {
+                        Program.SetStretchBltMode(dc, 3);   // COLORONCOLOR: fast decimation
+                        Program.StretchBlt(dc, 0, 0, scrW, scrH, dibHalfDC, 0, 0, scrW / 2, scrH / 2, 0x00CC0020);
+                    }
+                    else
+                        Program.BitBlt(dc, 0, 0, scrW, scrH, dibDC, 0, 0, 0x00CC0020);
+                }
                 finally { Program.ReleaseDC(Handle, dc); }
             }
             catch { }
@@ -1906,12 +1985,18 @@ namespace TechRain
             // worst case is a torn frame, never a crash)
             try
             {
-                if (dibDC != IntPtr.Zero)
+                IntPtr dc = e.Graphics.GetHdc();
+                try
                 {
-                    IntPtr dc = e.Graphics.GetHdc();
-                    try { Program.BitBlt(dc, 0, 0, Width, Height, dibDC, 0, 0, 0x00CC0020); }
-                    finally { e.Graphics.ReleaseHdc(dc); }
+                    if (halfRes && dibHalfDC != IntPtr.Zero)
+                    {
+                        Program.SetStretchBltMode(dc, 3);
+                        Program.StretchBlt(dc, 0, 0, scrW, scrH, dibHalfDC, 0, 0, scrW / 2, scrH / 2, 0x00CC0020);
+                    }
+                    else if (dibDC != IntPtr.Zero)
+                        Program.BitBlt(dc, 0, 0, scrW, scrH, dibDC, 0, 0, 0x00CC0020);
                 }
+                finally { e.Graphics.ReleaseHdc(dc); }
             }
             catch { }
         }
@@ -1924,10 +2009,15 @@ namespace TechRain
             try
             {
                 if (dibG != null) { dibG.Dispose(); dibG = null; }
+                if (dibHalfG != null) { dibHalfG.Dispose(); dibHalfG = null; }
                 if (dibDC != IntPtr.Zero && dibOld != IntPtr.Zero) Program.SelectObject(dibDC, dibOld);
                 if (dibBmp != IntPtr.Zero) Program.DeleteObject(dibBmp);
                 if (dibDC != IntPtr.Zero) Program.DeleteDC(dibDC);
+                if (dibHalfDC != IntPtr.Zero && dibHalfOld != IntPtr.Zero) Program.SelectObject(dibHalfDC, dibHalfOld);
+                if (dibHalfBmp != IntPtr.Zero) Program.DeleteObject(dibHalfBmp);
+                if (dibHalfDC != IntPtr.Zero) Program.DeleteDC(dibHalfDC);
                 dibDC = IntPtr.Zero; dibBmp = IntPtr.Zero; dibOld = IntPtr.Zero;
+                dibHalfDC = IntPtr.Zero; dibHalfBmp = IntPtr.Zero; dibHalfOld = IntPtr.Zero;
             }
             catch { }
             AppShell.ThemeChanged -= OnThemeChanged;
@@ -2317,7 +2407,7 @@ namespace TechRain
             {
                 if (meter == null)
                 {
-                    if (T - lastMeterTry < 5) return 0f;
+                    if (T - lastMeterTry < meterRetryDelay) return 0f;
                     lastMeterTry = T;
                     meter = CreateMeter();
                 }
@@ -2331,13 +2421,20 @@ namespace TechRain
                 peakN++; peakSumMs += ms;
                 // NEW-MACHINE self-heal: a meter created against a stale/early default
                 // endpoint (device ready after autostart, user switches device) reads
-                // zero forever. ~10s of straight zeros -> rebuild against the current
-                // default device. Between songs this costs one cheap COM activation.
-                if (p <= 0.0001f) { zeroStreak++; } else { zeroStreak = 0; }
+                // zero forever. First recreate after ~10s; if the machine's endpoint
+                // meter is fundamentally dead (576 recreations in 3.5h on the test
+                // machine = COM/GC storm that lagged the whole dock), back off hard:
+                // 10s -> 60s -> 5min -> 30min cap. Each recreation rotates the audio
+                // ROLE (console/multimedia/comms) - some machines only expose metering
+                // on a non-default role.
+                if (p <= 0.0001f) { zeroStreak++; } else { zeroStreak = 0; zeroFailures = 0; }
                 if (zeroStreak > 300)
                 {
-                    meter = null; zeroStreak = 0;
-                    Program.Log("[VU] meter read zero for ~10s -> recreated (endpoint may have changed)");
+                    zeroStreak = 0;
+                    zeroFailures++;
+                    meterRetryDelay = zeroFailures >= 4 ? 1800 : zeroFailures == 3 ? 300 : zeroFailures == 2 ? 60 : 10;
+                    meter = null;
+                    Program.Log("[VU] endpoint meter still zero (fail #" + zeroFailures + ") -> recreate, next in " + meterRetryDelay + "s");
                 }
                 if (peakN >= 120)
                 {
@@ -2350,17 +2447,26 @@ namespace TechRain
             }
             catch { meter = null; return 0f; }
         }
-        int peakN, zeroStreak;
+        int peakN, zeroStreak, zeroFailures;
+        double meterRetryDelay = 10;
         double peakSumMs, peakMaxMs;
 
+        // each recreation rotates the audio role: some machines expose metering
+        // only on a non-default role, and a role switch is free to try
+        static readonly int[] MeterRoles = { 0, 2, 3 };   // eConsole, eMultimedia, eCommunications
+        static int meterRoleIdx;
         static object CreateMeter()
         {
             IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
             IMMDevice dev;
-            en.GetDefaultAudioEndpoint(0, 0, out dev);
+            int role = MeterRoles[meterRoleIdx++ % MeterRoles.Length];
+            en.GetDefaultAudioEndpoint(0, role, out dev);
+            string devId;
+            try { dev.GetId(out devId); } catch { devId = "?"; }
             Guid iid = new Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064");
             object o;
             dev.Activate(ref iid, 23, IntPtr.Zero, out o);
+            Program.Log("[VU] meter bound role=" + role + " dev=" + devId);
             return o;
         }
 
@@ -4432,7 +4538,7 @@ namespace TechRain
         {
             public string Label; public string Path; public string ExeName;
             public Bitmap Icon;            // 128px master
-            public bool IsLink; public bool Running;
+            public bool IsLink; public bool Running; public bool IconFallback;   // icon is the letter tile - heal it from the running exe when seen
             public bool IsExtra;           // auto-detected running app (not pinned)
             public bool IsGear;            // the settings entry pinned at the end
             public bool IsSearch;          // the app-search entry next to the gear
@@ -4913,6 +5019,7 @@ namespace TechRain
                     }
                     Bitmap ic = null;
                     bool targetAlive = target.Length > 0 && File.Exists(target);
+                    bool usedTile = false;
                     if (targetAlive) ic = LoadBest(target);
                     // a DEAD lnk's shell icon is a generic blank-file glyph that reads
                     // as "unrendered" at dock size - try the START MENU lnk's own icon
@@ -4925,13 +5032,14 @@ namespace TechRain
                         Program.Log(string.Format("[DOCK] lnk '{0}': target='{1}' alive={2} startmenu={3} icon={4}",
                             label, target, targetAlive, smlnk ?? "none", ic != null ? "resolved" : "letter-tile"));
                     }
-                    if (ic == null) ic = LetterTile(label);   // never render a blank tile
+                    if (ic == null) { ic = LetterTile(label); usedTile = true; }   // never render a blank tile
                     pinned.Add(new DockItem
                     {
                         Label = label,
                         Path = f,
                         ExeName = target.Length > 0 ? Path.GetFileNameWithoutExtension(target) : "",
                         Icon = ic,
+                        IconFallback = usedTile,
                         IsLink = true
                     });
                 }
@@ -5133,6 +5241,36 @@ namespace TechRain
                     }
                 }
                 p.Running = run;
+            }
+            // NEW-MACHINE icon self-heal: a pinned item still wearing its letter
+            // tile picks up the REAL icon the first time its exe is seen running
+            // (the tray merge / window scan carries the true exe path), and the
+            // shipped dead lnk heals itself at the same time
+            foreach (DockItem p in pinned)
+            {
+                if (!p.IconFallback) continue;
+                string[] ns;
+                if (!Alias.TryGetValue(p.Label, out ns)) ns = new[] { p.ExeName };
+                foreach (string n2 in ns)
+                {
+                    if (string.IsNullOrEmpty(n2)) continue;
+                    DockItem src;
+                    if (!found.TryGetValue(n2.ToLower(), out src) || src == null || src.Path == null || !File.Exists(src.Path)) continue;
+                    try
+                    {
+                        Bitmap real = CachedIcon(src.Path);
+                        if (real != null)
+                        {
+                            p.Icon = real;
+                            p.IconFallback = false;
+                            p.ExeName = Path.GetFileNameWithoutExtension(src.Path);
+                            Program.Log("[DOCK] pinned '" + p.Label + "' icon healed from running exe " + src.Path);
+                            LaunchPathFor(p);   // also self-heals the shipped .lnk target
+                        }
+                    }
+                    catch { }
+                    break;
+                }
             }
             // extras = running apps that are not pinned
             List<DockItem> newExtras = new List<DockItem>();
@@ -5381,6 +5519,13 @@ namespace TechRain
                 string ap = AppPathsLookup(cand);
                 if (ap != null) return ap;
             }
+            // store-style installs never appear in App Paths and their start-menu
+            // entry may be renamed - the uninstall registry keeps the real location
+            foreach (string cand in cands)
+            {
+                string ru = RegistryUninstallLookup(cand);
+                if (ru != null) return ru;
+            }
             // fuzzy pass: any start-menu lnk whose name contains the label (or vice versa)
             foreach (string cand in cands)
             {
@@ -5470,6 +5615,70 @@ namespace TechRain
                 }
             }
             catch { }
+            return null;
+        }
+
+        // search the add/remove-programs registry for the app by display name and
+        // return its installed exe (InstallLocation scan, then DisplayIcon)
+        static string RegistryUninstallLookup(string label)
+        {
+            string[] roots =
+            {
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+            };
+            Microsoft.Win32.RegistryKey[] hives = { Microsoft.Win32.Registry.LocalMachine, Microsoft.Win32.Registry.CurrentUser };
+            string lLow = label.ToLower();
+            foreach (Microsoft.Win32.RegistryKey hive in hives)
+            {
+                foreach (string rp in roots)
+                {
+                    try
+                    {
+                        using (Microsoft.Win32.RegistryKey k = hive.OpenSubKey(rp))
+                        {
+                            if (k == null) continue;
+                            foreach (string sub in k.GetSubKeyNames())
+                            {
+                                using (Microsoft.Win32.RegistryKey sk = k.OpenSubKey(sub))
+                                {
+                                    if (sk == null) continue;
+                                    string dn = sk.GetValue("DisplayName") as string;
+                                    if (string.IsNullOrEmpty(dn)) continue;
+                                    if (dn.ToLower().IndexOf(lLow, StringComparison.Ordinal) < 0
+                                        && lLow.IndexOf(dn.ToLower(), StringComparison.Ordinal) < 0) continue;
+                                    string loc = sk.GetValue("InstallLocation") as string;
+                                    if (!string.IsNullOrEmpty(loc) && Directory.Exists(loc))
+                                    {
+                                        try
+                                        {
+                                            string[] exes = Directory.GetFiles(loc, "*.exe");
+                                            string best = null; long bestLen = 0;
+                                            foreach (string e in exes)
+                                            {
+                                                string bn = Path.GetFileNameWithoutExtension(e);
+                                                if (bn.ToLower().Contains(lLow) || lLow.Contains(bn.ToLower()) && bn.Length > 2) return e;
+                                                // fallback: the biggest exe is usually the app in flat installs
+                                                FileInfo fi = new FileInfo(e);
+                                                if (fi.Length > bestLen) { bestLen = fi.Length; best = e; }
+                                            }
+                                            if (best != null && bestLen > 500000) return best;   // >500KB: not a uninstaller stub
+                                        }
+                                        catch { }
+                                    }
+                                    string di = sk.GetValue("DisplayIcon") as string;
+                                    if (!string.IsNullOrEmpty(di))
+                                    {
+                                        di = di.Split(',')[0].Trim('"').Trim();
+                                        if (di.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(di)) return di;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
             return null;
         }
 
@@ -6055,6 +6264,41 @@ namespace TechRain
                     }
                     else if (it.IsLink)
                     {
+                        // NEW-MACHINE escape hatch: auto-resolution can miss store/
+                        // renamed installs - the user points at the exe once and the
+                        // lnk + icon heal permanently
+                        m.MenuItems.Add("重新定位应用…", delegate
+                        {
+                            try
+                            {
+                                using (OpenFileDialog ofd = new OpenFileDialog())
+                                {
+                                    ofd.Title = "选择 " + it.Label + " 的主程序";
+                                    ofd.Filter = "程序 (*.exe;*.lnk)|*.exe;*.lnk";
+                                    if (ofd.ShowDialog(this) == DialogResult.OK)
+                                    {
+                                        string tgt = ofd.FileName;
+                                        if (tgt.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) tgt = ResolveLnk(tgt);
+                                        if (string.IsNullOrEmpty(tgt) || !File.Exists(tgt)) return;
+                                        if (!string.IsNullOrEmpty(it.Path) && it.Path.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) && File.Exists(it.Path))
+                                        {
+                                            Type t3 = Type.GetTypeFromProgID("WScript.Shell");
+                                            object ws3 = Activator.CreateInstance(t3);
+                                            object sc3 = t3.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, ws3, new object[] { it.Path });
+                                            sc3.GetType().InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, sc3, new object[] { tgt });
+                                            sc3.GetType().InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, sc3, new object[] { Path.GetDirectoryName(tgt) });
+                                            sc3.GetType().InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, sc3, null);
+                                        }
+                                        it.ExeName = Path.GetFileNameWithoutExtension(tgt);
+                                        it.Icon = CachedIcon(tgt);
+                                        it.IconFallback = false;
+                                        Render();
+                                        Program.Log("[DOCK] '" + it.Label + "' re-targeted by user -> " + tgt);
+                                    }
+                                }
+                            }
+                            catch (Exception rex) { Program.Log("[DOCK] re-target failed: " + rex.Message); }
+                        });
                         m.MenuItems.Add("从 Dock 移除", delegate { try { File.Delete(display[idx].Path); } catch { } ReloadItems(); RebuildDisplay(); Relayout(); });
                     }
                     else if (it.IsBuiltin)
