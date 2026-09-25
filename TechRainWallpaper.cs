@@ -642,6 +642,30 @@ namespace TechRain
         // per-section frame-cost profile ([SCENE] log lines)
         static double ptBg, ptStars, ptHole, ptShoots;
         static int ptN;
+
+        // scale every pixel (PArgb: alpha AND rgb, keeps premultiplication
+        // consistent) - replaces a constant ColorMatrix ImageAttribute at draw
+        // time; the CM path is per-pixel software and starved the GDI lock
+        static void BakeAlphaMul(Bitmap b, float mul)
+        {
+            Rectangle r = new Rectangle(0, 0, b.Width, b.Height);
+            BitmapData d = b.LockBits(r, ImageLockMode.ReadWrite, PixelFormat.Format32bppPArgb);
+            try
+            {
+                int bytes = Math.Abs(d.Stride) * d.Height;
+                byte[] px = new byte[bytes];
+                Marshal.Copy(d.Scan0, px, 0, bytes);
+                for (int i = 0; i + 3 < bytes; i += 4)
+                {
+                    px[i] = (byte)(px[i] * mul);
+                    px[i + 1] = (byte)(px[i + 1] * mul);
+                    px[i + 2] = (byte)(px[i + 2] * mul);
+                    px[i + 3] = (byte)(px[i + 3] * mul);
+                }
+                Marshal.Copy(px, 0, d.Scan0, bytes);
+            }
+            finally { b.UnlockBits(d); }
+        }
         Bitmap frame;
         Random rnd = new Random();
 
@@ -670,7 +694,7 @@ namespace TechRain
         double tiltPhase;
         float[][] band = new float[3][];
 
-        Bitmap[] fogSpr; ImageAttributes[] fogAttr;
+        Bitmap[] fogSpr; Bitmap[][] fogBaked;
         PathGradientBrush[] glowPgb;
         Pen[][] rainPens;
         Pen[] ripplePens; SolidBrush snowBrush;
@@ -747,12 +771,21 @@ namespace TechRain
                 }
                 fogSpr[i] = b;
             }
-            fogAttr = new ImageAttributes[3];
-            for (int i = 0; i < 3; i++)
+            // baked alpha variants replace the ColorMatrix ImageAttributes at draw
+            // time: the CM path is per-pixel software and cost ~half the frame on
+            // theme 1/2. fogBaked[sprite][alphaIdx], alphaIdx matches the old attr.
+            fogBaked = new Bitmap[3][];
+            for (int sI = 0; sI < 3; sI++)
             {
-                fogAttr[i] = new ImageAttributes();
-                var cm = new ColorMatrix(); cm.Matrix33 = (0.35f + i * 0.3f);
-                fogAttr[i].SetColorMatrix(cm);
+                fogBaked[sI] = new Bitmap[3];
+                for (int aI = 0; aI < 3; aI++)
+                {
+                    Bitmap b = new Bitmap(fogSpr[sI].Width, fogSpr[sI].Height, PixelFormat.Format32bppPArgb);
+                    using (Graphics g = Graphics.FromImage(b))
+                        g.DrawImage(fogSpr[sI], 0, 0, b.Width, b.Height);
+                    BakeAlphaMul(b, 0.35f + aI * 0.3f);
+                    fogBaked[sI][aI] = b;
+                }
             }
             Color[] gcol = { Color.FromArgb(90, 80, 200, 255), Color.FromArgb(90, 170, 90, 255), Color.FromArgb(90, 220, 120, 255) };
             // 6 drifting radial glows used to be 512px sprites stretched per frame
@@ -1113,10 +1146,9 @@ namespace TechRain
                 for (int i = 0; i < fogs.Count; i++)
                 {
                     Fog f = fogs[i];
-                    Bitmap b = fogSpr[f.Spr];
+                    Bitmap b = fogBaked[f.Spr][1];
                     int dw = (int)(b.Width * f.Sc), dh = (int)(b.Height * f.Sc);
-                    g.DrawImage(b, new Rectangle((int)f.X, (int)f.Y - dh / 2, dw, dh),
-                        0, 0, b.Width, b.Height, GraphicsUnit.Pixel, fogAttr[1]);
+                    g.DrawImage(b, new Rectangle((int)f.X, (int)f.Y - dh / 2, dw, dh));
                 }
                 for (int l = 0; l <= 1; l++) DrawRainLayer(g, l, wind);
                 for (int i = 0; i < ripples.Count; i++)
@@ -1171,10 +1203,9 @@ namespace TechRain
                 for (int i = 0; i < fogs.Count; i++)
                 {
                     Fog f = fogs[i];
-                    Bitmap b = fogSpr[f.Spr];
+                    Bitmap b = fogBaked[f.Spr][0];
                     int dw = (int)(b.Width * f.Sc), dh = (int)(b.Height * f.Sc);
-                    g.DrawImage(b, new Rectangle((int)f.X, (int)f.Y - dh / 2, dw, dh),
-                        0, 0, b.Width, b.Height, GraphicsUnit.Pixel, fogAttr[0]);
+                    g.DrawImage(b, new Rectangle((int)f.X, (int)f.Y - dh / 2, dw, dh));
                 }
             }
             else if (Theme == 4)
@@ -4884,8 +4915,16 @@ namespace TechRain
                     bool targetAlive = target.Length > 0 && File.Exists(target);
                     if (targetAlive) ic = LoadBest(target);
                     // a DEAD lnk's shell icon is a generic blank-file glyph that reads
-                    // as "unrendered" at dock size - the letter tile is far better
+                    // as "unrendered" at dock size - try the START MENU lnk's own icon
+                    // (the real app icon) before falling back to the letter tile
                     if (ic == null && targetAlive) ic = LoadBest(f);
+                    if (ic == null)
+                    {
+                        string smlnk = FindStartMenuLnk(label) ?? FindStartMenuLnkFuzzy(label);
+                        if (smlnk != null) ic = LoadBest(smlnk);
+                        Program.Log(string.Format("[DOCK] lnk '{0}': target='{1}' alive={2} startmenu={3} icon={4}",
+                            label, target, targetAlive, smlnk ?? "none", ic != null ? "resolved" : "letter-tile"));
+                    }
                     if (ic == null) ic = LetterTile(label);   // never render a blank tile
                     pinned.Add(new DockItem
                     {
@@ -5362,7 +5401,9 @@ namespace TechRain
             string[] roots =
             {
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs")
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs"),
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory)
             };
             foreach (string root in roots)
             {
@@ -5378,7 +5419,9 @@ namespace TechRain
             string[] roots =
             {
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs")
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs"),
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory)
             };
             foreach (string root in roots)
             {
