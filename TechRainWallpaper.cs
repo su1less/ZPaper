@@ -1499,6 +1499,7 @@ namespace TechRain
         Graphics dibG;
         Thread renderThread;
         volatile bool renderRun;
+        bool staticPublished;
         int wallN;
         double wallDrawSum, wallPresentSum, wallPresentMax, wallUpdSum;
         Stopwatch sw = Stopwatch.StartNew();
@@ -1782,6 +1783,16 @@ namespace TechRain
                 // entirely - the wallpaper keeps its last frame at zero CPU cost
                 if (s != null && !AppShell.Paused && !fullscreenPause && !debugWallPause && dibG != null)
                 {
+                    // FIRST-RUN guarantee: after a couple of live frames, publish the
+                    // current scene as the system static wallpaper. A fresh machine
+                    // never had static_<theme>.png, and if the WorkerW attach loses
+                    // the DWM race there, the user still sees the theme wallpaper
+                    // instead of their old one. One-shot per launch, missing-file only.
+                    if (!staticPublished && rsw.Elapsed.TotalMilliseconds > 2500)
+                    {
+                        staticPublished = true;
+                        PublishStatic(s);
+                    }
                     double t0 = rsw.Elapsed.TotalMilliseconds;
                     double updMs = 0;
                     try
@@ -1806,6 +1817,29 @@ namespace TechRain
                 int wait = (int)(50 - (rsw.Elapsed.TotalMilliseconds - now));   // ~20fps cap: leaves GDI headroom for the dock
                 Thread.Sleep(wait < 1 ? 1 : wait);
             }
+        }
+
+        // draw the live scene once into a fresh bitmap and set it as the system
+        // static wallpaper - the first-run safety net (called ~2.5s after start,
+        // once, only when static_<theme>.png doesn't exist yet)
+        void PublishStatic(Scene s)
+        {
+            try
+            {
+                string tmp = Path.Combine(Program.BaseDir, "static_" + s.Theme + ".png");
+                if (File.Exists(tmp)) return;
+                using (Bitmap snap = new Bitmap(s.W, s.H, PixelFormat.Format32bppPArgb))
+                {
+                    using (Graphics sg = Graphics.FromImage(snap))
+                    {
+                        lock (AppShell.SceneLock) s.Draw(sg);
+                    }
+                    snap.Save(tmp, ImageFormat.Png);
+                }
+                Program.SetStaticWallpaper(tmp);
+                Program.Log("[WALL] first-run static published: " + tmp);
+            }
+            catch (Exception ex) { Program.Log("[WALL] first-run static failed: " + ex.Message); }
         }
 
         // BitBlt the finished DIB frame onto the window. A GDI+ DrawImage to the
@@ -2297,7 +2331,7 @@ namespace TechRain
                         float target;
                         if (peak > 0.012f)
                             target = (float)Math.Min(1, peak * (0.95 + 1.6 * Math.Abs(Math.Sin(T * spd[i] + ph[i]))));
-                        else target = 0.045f;
+                        else target = 0.06f + 0.07f * (float)Math.Abs(Math.Sin(T * 1.9 + ph[i] * 0.35f));   // idle: gentle breathing wave, never looks broken
                         vals[i] += (target - vals[i]) * (target > vals[i] ? 0.5f : 0.16f);
                         float h = Math.Max(3, vals[i] * maxH);
                         float x = baseX + i * (bw + gap);
@@ -4801,13 +4835,37 @@ namespace TechRain
                 Array.Sort(files);
                 foreach (string f in files)
                 {
+                    string label = Path.GetFileNameWithoutExtension(f);
                     string target = ResolveLnk(f);
+                    // NEW-USER fallback: dockApps lnks ship with the dev machine's
+                    // absolute targets. On a fresh machine they are dead → no icon,
+                    // no launch. Re-resolve by label from the Start Menu / App Paths
+                    // and self-heal the shipped lnk so later starts resolve directly.
+                    if (target.Length == 0 || !File.Exists(target))
+                    {
+                        string re = ResolveDeadLnk(label);
+                        if (re != null)
+                        {
+                            target = re;
+                            try
+                            {
+                                Type t2 = Type.GetTypeFromProgID("WScript.Shell");
+                                object ws2 = Activator.CreateInstance(t2);
+                                object sc2 = t2.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, ws2, new object[] { f });
+                                sc2.GetType().InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, sc2, new object[] { target });
+                                sc2.GetType().InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, sc2, new object[] { Path.GetDirectoryName(target) });
+                                sc2.GetType().InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, sc2, null);
+                            }
+                            catch { }
+                        }
+                    }
                     Bitmap ic = null;
                     if (target.Length > 0 && File.Exists(target)) ic = LoadBest(target);
                     if (ic == null) ic = LoadBest(f);
+                    if (ic == null) ic = LetterTile(label);   // never render a blank tile
                     pinned.Add(new DockItem
                     {
-                        Label = Path.GetFileNameWithoutExtension(f),
+                        Label = label,
                         Path = f,
                         ExeName = target.Length > 0 ? Path.GetFileNameWithoutExtension(target) : "",
                         Icon = ic,
@@ -5236,6 +5294,97 @@ namespace TechRain
             b = LoadBest(exePath);
             iconCache[exePath] = b;
             return b;
+        }
+
+        // NEW-USER support: a shipped dockApps lnk points at the dev machine's
+        // absolute target. Re-resolve the app by its dock label so the icon and
+        // the launch both work on a fresh machine.
+        static string ResolveDeadLnk(string label)
+        {
+            if (string.IsNullOrEmpty(label)) return null;
+            string lnk = FindStartMenuLnk(label);
+            if (lnk != null)
+            {
+                string t = ResolveLnk(lnk);
+                if (t.Length > 0 && File.Exists(t)) return t;
+            }
+            return AppPathsLookup(label);
+        }
+
+        static string FindStartMenuLnk(string label)
+        {
+            string want = label + ".lnk";
+            string[] roots =
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs")
+            };
+            foreach (string root in roots)
+            {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+                string hit = ScanLnkDir(root, want);
+                if (hit != null) return hit;
+            }
+            return null;
+        }
+
+        static string ScanLnkDir(string dir, string want)
+        {
+            try
+            {
+                foreach (string f in Directory.GetFiles(dir, "*.lnk"))
+                    if (string.Equals(Path.GetFileName(f), want, StringComparison.OrdinalIgnoreCase)) return f;
+                foreach (string d in Directory.GetDirectories(dir))
+                {
+                    string hit = ScanLnkDir(d, want);
+                    if (hit != null) return hit;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        static string AppPathsLookup(string label)
+        {
+            try
+            {
+                string key = @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\" + label + ".exe";
+                Microsoft.Win32.RegistryKey[] roots = { Microsoft.Win32.Registry.LocalMachine, Microsoft.Win32.Registry.CurrentUser };
+                foreach (Microsoft.Win32.RegistryKey root in roots)
+                {
+                    using (Microsoft.Win32.RegistryKey k = root.OpenSubKey(key))
+                    {
+                        if (k == null) continue;
+                        string exe = k.GetValue(null) as string;
+                        if (exe != null && exe.Length > 0 && File.Exists(exe)) return exe;
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // last-resort tile so a pinned app never renders as a blank square:
+        // rounded blue-gradient card + the label's first letter in white
+        static Bitmap LetterTile(string label)
+        {
+            string ch = string.IsNullOrEmpty(label) ? "?" : label.Substring(0, 1).ToUpper();
+            Bitmap m = new Bitmap(MASTER, MASTER, PixelFormat.Format32bppPArgb);
+            using (Graphics g = Graphics.FromImage(m))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (GraphicsPath p = WidgetPaint.RoundRect(0, 0, MASTER - 1, MASTER - 1, (int)(MASTER * 0.22f)))
+                using (LinearGradientBrush lg = new LinearGradientBrush(new Rectangle(0, 0, MASTER, MASTER),
+                    Color.FromArgb(255, 99, 181, 255), Color.FromArgb(255, 23, 90, 208), 90f))
+                    g.FillPath(lg, p);
+                using (Font f = new Font("Segoe UI", MASTER * 0.46f, FontStyle.Bold))
+                {
+                    SizeF sz = g.MeasureString(ch, f);
+                    using (SolidBrush wb = new SolidBrush(Color.White))
+                        g.DrawString(ch, f, wb, (MASTER - sz.Width) / 2f, (MASTER - sz.Height) / 2f);
+                }
+            }
+            return m;
         }
 
         static string ResolveLnk(string lnk)
