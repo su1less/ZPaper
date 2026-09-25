@@ -25,9 +25,17 @@
    - 左下：WASAPI 音量律动条
    - 拒绝"显示桌面"最小化（拦截 SC_MINIMIZE + 看门狗）
 
-## 运行与编译
+## 下载使用（普通用户看这里）
 
-- 直接运行：双击 `ZPapaer.exe`（开机自启已注册到 HKCU Run，指向本目录）
+1. 在本仓库页面点 **Code → Download ZIP**（或 `git clone`），**整体解压**——`ZPapaer.exe` 必须与 `bg/` 底图目录同层，单独拷走 exe 无法出图
+2. 双击 `ZPapaer.exe` 即可运行（Win10/11 自带 .NET Framework 4.8，无需安装任何运行时）
+3. 开机自启：`Win+R` 输入 `shell:startup` 回车，把 ZPapaer.exe 的快捷方式放进打开的文件夹
+4. 想把应用固定到 Dock：把它的 .lnk 快捷方式丢进 `dockApps/` 文件夹即自动上船
+5. 退出：Dock 末端 ⚙ 菜单 → 退出（自动恢复原生任务栏）
+
+## 运行与编译（开发者）
+
+- 本机直接运行：双击 `ZPapaer.exe`（开发机开机自启已注册到 HKCU Run，指向本目录）
 - 重新编译（改完源码后）：
   ```
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:anycpu -codepage:65001 -win32icon:app.ico -out:ZPapaer.exe -r:System.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll TechRainWallpaper.cs
