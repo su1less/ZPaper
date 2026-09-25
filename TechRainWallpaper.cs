@@ -6426,6 +6426,39 @@ namespace TechRain
             return pids.Contains(fgPid);
         }
 
+        // launch path for a pinned item: a live .Path wins; a dead shipped .lnk is
+        // re-resolved (start menu / app paths / fuzzy) and cached into the item so
+        // the click actually starts the app on a fresh machine
+        static string LaunchPathFor(DockItem it)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(it.Path) && File.Exists(it.Path)) return it.Path;
+                string re = ResolveDeadLnk(it.Label);
+                if (re != null)
+                {
+                    Program.Log("[ACT] launch path re-resolved for '" + it.Label + "' -> " + re);
+                    // self-heal the shipped lnk so the icon and future launches work
+                    if (!string.IsNullOrEmpty(it.Path) && it.Path.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) && File.Exists(it.Path))
+                    {
+                        try
+                        {
+                            Type t2 = Type.GetTypeFromProgID("WScript.Shell");
+                            object ws2 = Activator.CreateInstance(t2);
+                            object sc2 = t2.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, ws2, new object[] { it.Path });
+                            sc2.GetType().InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, sc2, new object[] { re });
+                            sc2.GetType().InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, sc2, new object[] { Path.GetDirectoryName(re) });
+                            sc2.GetType().InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, sc2, null);
+                        }
+                        catch { }
+                    }
+                    return re;
+                }
+            }
+            catch (Exception ex) { Program.Log("[ACT] LaunchPathFor '" + it.Label + "' failed: " + ex.Message); }
+            return null;
+        }
+
         // decides on the spot: cold-launch a dead app, or activate an existing window
         static void TryActivate(DockItem it)
         {
@@ -6474,7 +6507,10 @@ namespace TechRain
                 }
                 if (wins.Count == 0 && it.Label.Length > 0)
                     CollectWins(0, it.Label, wins, false);
-                if (it.Win != IntPtr.Zero && !wins.Contains(it.Win)) wins.Add(it.Win);
+                // a dead .lnk's shell ghost handle (or any gone window) must not
+                // block the cold launch: pids=0 + one stale handle previously
+                // defeated the "provably not running" test forever
+                if (it.Win != IntPtr.Zero && Program.IsWindow(it.Win) && !wins.Contains(it.Win)) wins.Add(it.Win);
                 // dedupe
                 List<IntPtr> uniq = new List<IntPtr>();
                 foreach (IntPtr h in wins) if (!uniq.Contains(h)) uniq.Add(h);
@@ -6484,14 +6520,15 @@ namespace TechRain
                 // cold launch ONLY when the app is provably not running and has no windows
                 if (pids.Count == 0 && wins.Count == 0)
                 {
-                    Program.Log("[ACT] not running -> cold launch " + it.Path);
-                    LauncherForm.RecordRecent(it.Path);
+                    string launchPath = LaunchPathFor(it);
+                    Program.Log("[ACT] not running -> cold launch " + launchPath);
+                    LauncherForm.RecordRecent(launchPath);
                     try
                     {
-                        Process proc = Process.Start(new ProcessStartInfo(it.Path) { UseShellExecute = true });
+                        Process proc = Process.Start(new ProcessStartInfo(launchPath) { UseShellExecute = true });
                         if (proc != null) { it.LaunchPid = proc.Id; it.Running = true; }
                     }
-                    catch { }
+                    catch (Exception lex) { Program.Log("[ACT] cold launch failed: " + lex.Message); }
                     return;
                 }
 
@@ -6652,16 +6689,21 @@ namespace TechRain
                 {
                     bool drHit = DirectRestore.Contains(it.Label ?? "");
                     foreach (string n in names) if (DirectRestore.Contains(n)) drHit = true;
-                    if (drHit && !string.IsNullOrEmpty(it.Path) && File.Exists(it.Path))
+                    if (drHit)
                     {
-                        Program.Log("[ACT] direct-launch: fully hidden, no titled window -> re-invoke lnk (" + it.Label + ")");
-                        string lnk = it.Path;
-                        ThreadPool.QueueUserWorkItem(delegate
+                        string launchPath = LaunchPathFor(it);
+                        if (launchPath != null)
                         {
-                            try { Process.Start(new ProcessStartInfo(lnk) { UseShellExecute = true }); }
-                            catch (Exception ex) { Program.Log("[ACT] direct-launch failed: " + ex.Message); }
-                        });
-                        return;
+                            Program.Log("[ACT] direct-launch: fully hidden, no titled window -> re-invoke (" + it.Label + " via " + launchPath + ")");
+                            string lnk = launchPath;
+                            ThreadPool.QueueUserWorkItem(delegate
+                            {
+                                try { Process.Start(new ProcessStartInfo(lnk) { UseShellExecute = true }); }
+                                catch (Exception ex) { Program.Log("[ACT] direct-launch failed: " + ex.Message); }
+                            });
+                            return;
+                        }
+                        Program.Log("[ACT] direct-launch wanted but no resolvable launch path for " + it.Label);
                     }
                 }
 
