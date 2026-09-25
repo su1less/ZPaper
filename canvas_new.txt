@@ -1,0 +1,196 @@
+    // ============ owner-drawn tile canvas: hundreds of tiles, ZERO child controls ============
+    // (per-tile Panels made the launcher freeze and crash with 190 apps - one paint
+    // pass over a hit-tested canvas is instant and cannot storm the layout engine)
+    class TileCanvas : Control
+    {
+        public class TTile { public string Name; public string Path; public Bitmap Icon; public object Tag; public Rectangle Rect; public bool Vis = true; }
+        public class TSec { public string Title; public Color Color; public List<TTile> Items = new List<TTile>(); public Rectangle HeadRect; public bool AnyVis; }
+        public List<TSec> Sections = new List<TSec>();
+        public string FilterText = "";
+        public event Action<TTile> ItemClicked;
+
+        const int TILE_W = 102, TILE_H = 110, PAD_X = 10, HEAD_H = 36, SEC_GAP = 12;
+        Font headFont, nameFont;
+        TTile hover;
+        int viewW = 800;
+
+        public TileCanvas()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                   | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+            BackColor = Color.Transparent;
+            headFont = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
+            nameFont = new Font("Microsoft YaHei UI", 8.5f);
+        }
+
+        public TSec NewSection(string title, Color c)
+        {
+            TSec s = new TSec();
+            s.Title = title; s.Color = c;
+            Sections.Add(s);
+            return s;
+        }
+
+        public static TTile Mk(string name, string path, Bitmap icon, object tag)
+        {
+            TTile t = new TTile();
+            t.Name = name; t.Path = path; t.Icon = icon; t.Tag = tag;
+            return t;
+        }
+
+        public void Finish(int width)
+        {
+            viewW = width;
+            Measure();
+            Invalidate();
+        }
+
+        public void Refilter(int width, string q)
+        {
+            FilterText = q == null ? "" : q.Trim().ToLower();
+            viewW = width;
+            Measure();
+            Invalidate();
+        }
+
+        public int VisibleCount
+        {
+            get
+            {
+                int n = 0;
+                foreach (TSec s in Sections) foreach (TTile t in s.Items) if (t.Vis) n++;
+                return n;
+            }
+        }
+
+        public TTile FirstVisible()
+        {
+            foreach (TSec s in Sections) foreach (TTile t in s.Items) if (t.Vis) return t;
+            return null;
+        }
+
+        void Measure()
+        {
+            string q = FilterText;
+            int y = 8;
+            int inner = Math.Max(200, viewW - 26);
+            foreach (TSec s in Sections)
+            {
+                s.AnyVis = false;
+                foreach (TTile t in s.Items)
+                {
+                    t.Vis = q.Length == 0 || t.Name.ToLower().Contains(q) || (t.Path != null && t.Path.ToLower().Contains(q));
+                    if (t.Vis) s.AnyVis = true;
+                }
+                if (!s.AnyVis) { s.HeadRect = Rectangle.Empty; continue; }
+                s.HeadRect = new Rectangle(8, y, inner, 26);
+                y += HEAD_H;
+                int x = 6;
+                foreach (TTile t in s.Items)
+                {
+                    if (!t.Vis) { t.Rect = Rectangle.Empty; continue; }
+                    if (x + TILE_W > inner) { x = 6; y += TILE_H; }
+                    t.Rect = new Rectangle(x, y, TILE_W, TILE_H - 8);
+                    x += TILE_W + PAD_X;
+                }
+                y += TILE_H + SEC_GAP;
+            }
+            Size = new Size(viewW, y + 12);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            try
+            {
+                Graphics g = e.Graphics;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                foreach (TSec s in Sections)
+                {
+                    if (!s.AnyVis) continue;
+                    using (SolidBrush hb = new SolidBrush(s.Color))
+                        g.DrawString(s.Title, headFont, hb, s.HeadRect.Left + 2, s.HeadRect.Top);
+                    foreach (TTile t in s.Items)
+                    {
+                        if (!t.Vis) continue;
+                        if (t == hover)
+                        {
+                            using (GraphicsPath hp = WidgetPaint.RoundRect(t.Rect.X + 4, t.Rect.Y + 2, TILE_W - 8, TILE_H - 14, 10))
+                            using (SolidBrush hbr = new SolidBrush(Color.FromArgb(60, 90, 150, 220)))
+                                g.FillPath(hbr, hp);
+                        }
+                        int icx = t.Rect.X + t.Rect.Width / 2;
+                        if (t.Icon != null)
+                            g.DrawImage(t.Icon, new Rectangle(icx - 24, t.Rect.Y + 2, 48, 48));
+                        else
+                        {
+                            using (SolidBrush db = new SolidBrush(Color.FromArgb(160, 90, 160, 235)))
+                                g.FillEllipse(db, icx - 20, t.Rect.Y + 6, 40, 40);
+                        }
+                        // name: up to 2 centered lines with ellipsis
+                        DrawTwoLines(g, t.Name, nameFont, t.Rect.X + 1, t.Rect.Y + 56, t.Rect.Width - 2);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        void DrawTwoLines(Graphics g, string text, Font f, int cx, int y, int w)
+        {
+            try
+            {
+                string l1 = text, l2 = null;
+                SizeF sz = g.MeasureString(text, f);
+                if (sz.Width > w)
+                {
+                    // split roughly in half at a char boundary
+                    int cut = text.Length / 2;
+                    while (cut > 1 && g.MeasureString(text.Substring(0, cut), f).Width > w) cut--;
+                    l1 = text.Substring(0, cut);
+                    l2 = text.Substring(cut);
+                    while (l2.Length > 1 && g.MeasureString(l2, f).Width > w) l2 = l2.Substring(0, l2.Length - 1);
+                    if (text.Length > l1.Length + l2.Length) l2 += "…";
+                }
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(230, 230, 236, 246)))
+                {
+                    SizeF s1 = g.MeasureString(l1, f);
+                    g.DrawString(l1, f, b, cx + (w - s1.Width) / 2f, y);
+                    if (l2 != null)
+                    {
+                        SizeF s2 = g.MeasureString(l2, f);
+                        g.DrawString(l2, f, b, cx + (w - s2.Width) / 2f, y + s1.Height - 3);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        TTile HitTest(Point p)
+        {
+            foreach (TSec s in Sections)
+                foreach (TTile t in s.Items)
+                    if (t.Vis && t.Rect.Contains(p)) return t;
+            return null;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            TTile t = HitTest(e.Location);
+            if (t != hover) { hover = t; Invalidate(); }
+            Cursor = t != null ? Cursors.Hand : Cursors.Default;
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            if (hover != null) { hover = null; Invalidate(); }
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            TTile t = HitTest(e.Location);
+            if (t != null && ItemClicked != null) ItemClicked(t);
+            base.OnMouseClick(e);
+        }
+    }
+

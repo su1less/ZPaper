@@ -1,0 +1,424 @@
+    // ============ app launcher v2: fake-acrylic fullscreen, categories, recents ============
+    class LauncherForm : Form
+    {
+        TextBox box;
+        ScrollPanel content;
+        Label status;
+        List<Tile> tiles = new List<Tile>();
+        List<Section> sections = new List<Section>();
+        class Tile { public string Name; public string Path; public string Cat; public Bitmap Icon; public Control Ctl; }
+        class Section { public string Name; public Label Head; public FlowPanel Host; public List<Tile> Items = new List<Tile>(); }
+        class ScrollPanel : Panel { public ScrollPanel() { DoubleBuffered = true; BackColor = Color.Transparent; AutoScroll = true; } }
+        class FlowPanel : FlowLayoutPanel { public FlowPanel() { DoubleBuffered = true; BackColor = Color.Transparent; AutoSize = true; AutoSizeMode = AutoSizeMode.GrowAndShrink; WrapContents = true; } }
+
+        // ---------- recent/frequent tracking (shared with dock cold launches) ----------
+        static object recLock = new object();
+        static Dictionary<string, long[]> recents;   // pathLower -> { lastTicks, count }
+        static string RecentFile { get { return Path.Combine(Program.BaseDir, "zpapaer_recent.txt"); } }
+        static void LoadRecents()
+        {
+            if (recents != null) return;
+            recents = new Dictionary<string, long[]>();
+            try
+            {
+                foreach (string line in File.ReadAllLines(RecentFile))
+                {
+                    string[] p = line.Split('|');
+                    if (p.Length != 3) continue;
+                    long t, c;
+                    if (long.TryParse(p[0], out t) && long.TryParse(p[1], out c))
+                        recents[p[2].ToLower()] = new long[] { t, c };
+                }
+            }
+            catch { }
+        }
+        public static void RecordRecent(string path)
+        {
+            if (path == null || path.Length == 0) return;
+            try
+            {
+                lock (recLock)
+                {
+                    LoadRecents();
+                    string k = path.ToLower();
+                    long[] e;
+                    if (!recents.TryGetValue(k, out e)) e = new long[] { 0, 0 };
+                    e[0] = DateTime.Now.Ticks; e[1]++;
+                    recents[k] = e;
+                    StringBuilder sb = new StringBuilder();
+                    foreach (KeyValuePair<string, long[]> kv in recents)
+                        sb.AppendLine(kv.Value[0] + "|" + kv.Value[1] + "|" + kv.Key);
+                    File.WriteAllText(RecentFile, sb.ToString());
+                }
+            }
+            catch { }
+        }
+
+        // launcher-scoped icon cache (separate from the dock's, avoids cross-thread races)
+        static object iconLock = new object();
+        static Dictionary<string, Bitmap> licons = new Dictionary<string, Bitmap>();
+
+        public static void ShowLauncher()
+        {
+            try
+            {
+                LauncherForm f = new LauncherForm();
+                f.Show();
+                f.Activate();
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] open fail " + ex.Message); }
+        }
+
+        public LauncherForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            KeyPreview = true;
+            Rectangle sc = Screen.PrimaryScreen.Bounds;
+            int m = Math.Max(8, sc.Height / 40);            // near-fullscreen with slim margin
+            Bounds = new Rectangle(m, m, sc.Width - 2 * m, sc.Height - 2 * m);
+            BackColor = Color.FromArgb(16, 21, 36);
+            DoubleBuffered = true;
+
+            Label title = new Label();
+            title.Text = "搜索应用";
+            title.ForeColor = Color.FromArgb(165, 150, 180, 215);
+            title.Font = new Font("Microsoft YaHei UI", 11f);
+            title.AutoSize = true;
+            title.Location = new Point(34, 26);
+            Controls.Add(title);
+
+            Label close = new Label();
+            close.Text = "✕  关闭";
+            close.ForeColor = Color.FromArgb(175, 155, 170, 195);
+            close.Font = new Font("Microsoft YaHei UI", 10f);
+            close.AutoSize = true;
+            close.Location = new Point(Width - 116, 26);
+            close.Cursor = Cursors.Hand;
+            close.Click += delegate { Close(); };
+            Controls.Add(close);
+
+            box = new TextBox();
+            box.BorderStyle = BorderStyle.None;
+            box.BackColor = Color.FromArgb(255, 28, 35, 56);
+            box.ForeColor = Color.White;
+            box.Font = new Font("Microsoft YaHei UI", 16f);
+            box.Bounds = new Rectangle(Width / 2 - 360, 60, 720, 48);
+            box.TextChanged += delegate { ApplyFilter(); };
+            Controls.Add(box);
+
+            status = new Label();
+            status.Text = "";
+            status.ForeColor = Color.FromArgb(140, 135, 155, 185);
+            status.Font = new Font("Microsoft YaHei UI", 9f);
+            status.AutoSize = true;
+            status.Location = new Point(Width / 2 - 360, 116);
+            Controls.Add(status);
+
+            content = new ScrollPanel();
+            content.Bounds = new Rectangle(28, 142, Width - 56, Height - 168);
+            Controls.Add(content);
+
+            Paint += delegate(object s, PaintEventArgs e)
+            {
+                using (Pen p = new Pen(Color.FromArgb(80, 96, 210, 255), 1.3f))
+                    e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+                using (Pen p2 = new Pen(Color.FromArgb(60, 96, 150, 210), 1f))
+                    e.Graphics.DrawRectangle(p2, box.Left - 12, box.Top - 9, box.Width + 24, box.Height + 16);
+            };
+            Deactivate += delegate { Close(); };     // clicking outside closes
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) Close();
+                else if (e.KeyCode == Keys.Enter) { LaunchFirst(); e.Handled = true; }
+            };
+
+            Shown += delegate
+            {
+                box.Focus();
+                status.Text = " 正在加载应用列表…";
+                ThreadPool.QueueUserWorkItem(delegate { Populate(); });
+            };
+        }
+
+        // fake acrylic: capture what is behind the window, blur it, dark-tint it,
+        // and use it as the background image - works everywhere, no DWM dependency
+        void BuildAcrylicBackground()
+        {
+            try
+            {
+                using (Bitmap raw = new Bitmap(Width, Height))
+                {
+                    using (Graphics g = Graphics.FromImage(raw))
+                        g.CopyFromScreen(Left, Top, 0, 0, raw.Size);
+                    int sw = Math.Max(1, Width / 10), sh = Math.Max(1, Height / 10);
+                    using (Bitmap small = new Bitmap(raw, sw, sh))
+                    {
+                        for (int i = 0; i < 3; i++) BoxBlur(small);
+                        using (Bitmap bg = new Bitmap(small, Width, Height))
+                        using (Graphics g = Graphics.FromImage(bg))
+                        {
+                            using (SolidBrush tint = new SolidBrush(Color.FromArgb(178, 14, 18, 32)))
+                                g.FillRectangle(tint, 0, 0, Width, Height);
+                            BackgroundImage = (Image)bg.Clone();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] acrylic fail " + ex.Message); }
+        }
+
+        static void BoxBlur(Bitmap b)
+        {
+            try
+            {
+                Rectangle r = new Rectangle(0, 0, b.Width, b.Height);
+                BitmapData d = b.LockBits(r, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+                int w = b.Width, h = b.Height, stride = d.Stride;
+                byte[] px = new byte[stride * h];
+                Marshal.Copy(d.Scan0, px, 0, px.Length);
+                byte[] tmp = new byte[px.Length];
+                for (int pass = 0; pass < 2; pass++)   // horizontal + vertical
+                {
+                    bool horiz = pass == 0;
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++)
+                        {
+                            int a = 0, rr = 0, gg = 0, bb = 0, n = 0;
+                            for (int k = -1; k <= 1; k++)
+                            {
+                                int xx = horiz ? x + k : x, yy = horiz ? y : y + k;
+                                if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+                                int i = yy * stride + xx * 4;
+                                a += px[i]; rr += px[i + 1]; gg += px[i + 2]; bb += px[i + 3]; n++;
+                            }
+                            int o = y * stride + x * 4;
+                            tmp[o] = (byte)(a / n); tmp[o + 1] = (byte)(rr / n);
+                            tmp[o + 2] = (byte)(gg / n); tmp[o + 3] = (byte)(bb / n);
+                        }
+                    byte[] swap = px; px = tmp; tmp = swap;
+                }
+                Marshal.Copy(px, 0, d.Scan0, px.Length);
+                b.UnlockBits(d);
+            }
+            catch { }
+        }
+
+        void LaunchFirst()
+        {
+            foreach (Tile t in tiles)
+                if (t.Ctl != null && t.Ctl.Visible) { Launch(t); return; }
+        }
+
+        void Launch(Tile t)
+        {
+            RecordRecent(t.Path);
+            try { Process.Start(new ProcessStartInfo(t.Path) { UseShellExecute = true }); }
+            catch (Exception ex) { Program.Log("[LAUNCH] start fail " + ex.Message); }
+            Close();
+        }
+
+        void ApplyFilter()
+        {
+            string q = (box.Text ?? "").Trim().ToLower();
+            foreach (Section s in sections)
+            {
+                int vis = 0;
+                foreach (Tile t in s.Items)
+                {
+                    bool show = q.Length == 0 || t.Name.ToLower().Contains(q) || t.Cat.ToLower().Contains(q) || t.Path.ToLower().Contains(q);
+                    if (t.Ctl != null) t.Ctl.Visible = show;
+                    if (show) vis++;
+                }
+                if (s.Head != null) s.Head.Visible = vis > 0;
+                if (s.Host != null) s.Host.Visible = vis > 0;
+            }
+            int total = 0;
+            foreach (Tile t in tiles) if (t.Ctl != null && t.Ctl.Visible) total++;
+            status.Text = q.Length == 0 ? "" : (" " + total + " 个匹配 - 回车启动第一个");
+        }
+
+        // ---------- background population ----------
+        void Populate()
+        {
+            try
+            {
+                BuildAcrylicBackground();          // worker thread: capture+blur behind us
+                HashSet<string> seen = new HashSet<string>();
+                List<Tile> list = new List<Tile>();
+                string[] roots = {
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData) + @"\Microsoft\Windows\Start Menu\Programs",
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData) + @"\Microsoft\Windows\Start Menu\Programs" };
+                foreach (string root in roots)
+                {
+                    try
+                    {
+                        foreach (string lnk in Directory.GetFiles(root, "*.lnk", SearchOption.AllDirectories))
+                        {
+                            string nm = Path.GetFileNameWithoutExtension(lnk);
+                            string low = nm.ToLower();
+                            if (low.Contains("uninstall") || nm.Contains("卸载") || low.Contains("readme") || low.Contains("website") || low.Contains("visit") || low.Contains("error") || low.Contains("crash")) continue;
+                            if (!seen.Add(low)) continue;
+                            string cat = Path.GetFileName(Path.GetDirectoryName(lnk));
+                            if (cat.ToLower() == "programs" || cat.Length == 0) cat = "其他";
+                            Tile t = new Tile();
+                            t.Name = nm;
+                            t.Path = lnk;
+                            t.Cat = cat;
+                            t.Icon = IconFor(lnk);
+                            list.Add(t);
+                        }
+                    }
+                    catch (Exception ex) { Program.Log("[LAUNCH] enum fail " + ex.Message); }
+                }
+                list.Sort(delegate(Tile a, Tile b) { return string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase); });
+                SafeInvoke(delegate { BuildUi(list); });
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] populate fail " + ex.Message); }
+        }
+
+        Bitmap IconFor(string path)
+        {
+            lock (iconLock)
+            {
+                Bitmap c;
+                if (licons.TryGetValue(path, out c)) return c;
+                Bitmap raw = null;
+                try { raw = DockForm.LoadBest(path); } catch { }
+                if (raw == null) return null;
+                Bitmap sized = new Bitmap(raw, 48, 48);
+                raw.Dispose();
+                licons[path] = sized;
+                return sized;
+            }
+        }
+
+        void SafeInvoke(MethodInvoker d)
+        {
+            try { if (!IsDisposed && !Disposing) BeginInvoke(d); }
+            catch { }   // form closed while populating - just stop, never crash the app
+        }
+
+        // ---------- UI building (UI thread) ----------
+        void BuildUi(List<Tile> list)
+        {
+            if (IsDisposed) return;
+            try
+            {
+                List<Tile> recentTiles = new List<Tile>();
+                lock (recLock)
+                {
+                    LoadRecents();
+                    List<KeyValuePair<string, long[]>> order = new List<KeyValuePair<string, long[]>>(recents);
+                    order.Sort(delegate(KeyValuePair<string, long[]> a, KeyValuePair<string, long[]> b)
+                    {
+                        return Score(b.Value).CompareTo(Score(a.Value));
+                    });
+                    foreach (KeyValuePair<string, long[]> kv in order)
+                    {
+                        if (recentTiles.Count >= 12) break;
+                        foreach (Tile t in list)
+                            if (t.Path.ToLower() == kv.Key) { recentTiles.Add(t); break; }
+                    }
+                }
+                if (recentTiles.Count > 0) AddSection("最近使用", recentTiles, Color.FromArgb(255, 110, 205, 255));
+
+                Dictionary<string, List<Tile>> cats = new Dictionary<string, List<Tile>>();
+                foreach (Tile t in list)
+                {
+                    if (recentTiles.Contains(t)) continue;
+                    List<Tile> c;
+                    if (!cats.TryGetValue(t.Cat, out c)) { c = new List<Tile>(); cats[t.Cat] = c; }
+                    c.Add(t);
+                }
+                List<string> keys = new List<string>(cats.Keys);
+                keys.Sort(delegate(string a, string b)
+                {
+                    if (a == "其他" && b != "其他") return 1;
+                    if (b == "其他" && a != "其他") return -1;
+                    return string.Compare(a, b, StringComparison.CurrentCulture);
+                });
+                foreach (string k in keys) AddSection(k, cats[k], Color.FromArgb(200, 150, 175, 215));
+
+                tiles = list;
+                LayoutSections();
+                status.Text = "";
+                ApplyFilter();
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] buildui fail " + ex.Message); }
+        }
+
+        static double Score(long[] e)
+        {
+            double hours = (DateTime.Now.Ticks - e[0]) / 36000000000.0;
+            return e[1] * 2.0 - hours * 0.05;   // each launch +2, decays over time
+        }
+
+        // stack sections vertically inside the scroll panel
+        void LayoutSections()
+        {
+            int y = 4;
+            int innerW = content.ClientSize.Width - 26;
+            foreach (Section s in sections)
+            {
+                s.Head.Location = new Point(8, y);
+                int headH = 30;
+                y += headH;
+                s.Host.Location = new Point(6, y);
+                s.Host.MaximumSize = new Size(innerW, 0);
+                s.Host.MinimumSize = new Size(innerW, 0);
+                y += s.Host.PreferredSize.Height + 16;
+            }
+        }
+
+        void AddSection(string name, List<Tile> items, Color headColor)
+        {
+            Section s = new Section();
+            s.Name = name;
+            s.Items = items;
+            s.Head = new Label();
+            s.Head.Text = name;
+            s.Head.ForeColor = headColor;
+            s.Head.Font = new Font("Microsoft YaHei UI", 12.5f, FontStyle.Bold);
+            s.Head.AutoSize = true;
+            s.Head.BackColor = Color.Transparent;
+            content.Controls.Add(s.Head);
+            s.Host = new FlowPanel();
+            s.Host.BackColor = Color.Transparent;
+            content.Controls.Add(s.Host);
+            foreach (Tile t in items)
+            {
+                Panel p = new Panel();
+                p.Size = new Size(102, 112);
+                p.Margin = new Padding(8, 6, 8, 6);
+                p.Cursor = Cursors.Hand;
+                p.BackColor = Color.Transparent;
+                PictureBox ic = new PictureBox();
+                ic.Size = new Size(48, 48);
+                ic.Location = new Point(27, 4);
+                ic.SizeMode = PictureBoxSizeMode.Zoom;
+                ic.BackColor = Color.Transparent;
+                if (t.Icon != null) ic.Image = t.Icon;
+                Label lb = new Label();
+                lb.Text = t.Name;
+                lb.ForeColor = Color.FromArgb(230, 232, 240);
+                lb.BackColor = Color.Transparent;
+                lb.Font = new Font("Microsoft YaHei UI", 8.5f);
+                lb.Size = new Size(100, 34);
+                lb.Location = new Point(1, 60);
+                lb.TextAlign = ContentAlignment.TopCenter;
+                p.Controls.Add(ic);
+                p.Controls.Add(lb);
+                Tile cur = t;
+                p.Click += delegate { Launch(cur); };
+                ic.Click += delegate { Launch(cur); };
+                lb.Click += delegate { Launch(cur); };
+                t.Ctl = p;
+                s.Host.Controls.Add(p);
+            }
+            sections.Add(s);
+        }
+    }
+

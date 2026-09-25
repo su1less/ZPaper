@@ -1,0 +1,321 @@
+    // ============ app launcher v3: acrylic fullscreen + owner-drawn canvas + recents ============
+    class LauncherForm : Form
+    {
+        TextBox box;
+        Panel scroll;
+        TileCanvas canvas;
+        Label status;
+
+        // ---------- recent/frequent tracking (shared with dock cold launches) ----------
+        static object recLock = new object();
+        static Dictionary<string, long[]> recents;   // pathLower -> { lastTicks, count }
+        static string RecentFile { get { return Path.Combine(Program.BaseDir, "zpapaer_recent.txt"); } }
+        static void LoadRecents()
+        {
+            if (recents != null) return;
+            recents = new Dictionary<string, long[]>();
+            try
+            {
+                foreach (string line in File.ReadAllLines(RecentFile))
+                {
+                    string[] p = line.Split('|');
+                    if (p.Length != 3) continue;
+                    long t, c;
+                    if (long.TryParse(p[0], out t) && long.TryParse(p[1], out c))
+                        recents[p[2].ToLower()] = new long[] { t, c };
+                }
+            }
+            catch { }
+        }
+        public static void RecordRecent(string path)
+        {
+            if (path == null || path.Length == 0) return;
+            try
+            {
+                lock (recLock)
+                {
+                    LoadRecents();
+                    string k = path.ToLower();
+                    long[] e;
+                    if (!recents.TryGetValue(k, out e)) e = new long[] { 0, 0 };
+                    e[0] = DateTime.Now.Ticks; e[1]++;
+                    recents[k] = e;
+                    StringBuilder sb = new StringBuilder();
+                    foreach (KeyValuePair<string, long[]> kv in recents)
+                        sb.AppendLine(kv.Value[0] + "|" + kv.Value[1] + "|" + kv.Key);
+                    File.WriteAllText(RecentFile, sb.ToString());
+                }
+            }
+            catch { }
+        }
+
+        public static void ShowLauncher()
+        {
+            try
+            {
+                LauncherForm f = new LauncherForm();
+                f.Show();
+                f.Activate();
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] open fail " + ex.Message); }
+        }
+
+        public LauncherForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            KeyPreview = true;
+            Rectangle sc = Screen.PrimaryScreen.Bounds;
+            int m = Math.Max(8, sc.Height / 40);            // near-fullscreen with slim margin
+            Bounds = new Rectangle(m, m, sc.Width - 2 * m, sc.Height - 2 * m);
+            BackColor = Color.FromArgb(16, 21, 36);
+            DoubleBuffered = true;
+
+            Label title = new Label();
+            title.Text = "搜索应用";
+            title.ForeColor = Color.FromArgb(165, 150, 180, 215);
+            title.Font = new Font("Microsoft YaHei UI", 11f);
+            title.AutoSize = true;
+            title.Location = new Point(34, 26);
+            Controls.Add(title);
+
+            Label close = new Label();
+            close.Text = "✕  关闭";
+            close.ForeColor = Color.FromArgb(175, 155, 170, 195);
+            close.Font = new Font("Microsoft YaHei UI", 10f);
+            close.AutoSize = true;
+            close.Location = new Point(Width - 116, 26);
+            close.Cursor = Cursors.Hand;
+            close.Click += delegate { Close(); };
+            Controls.Add(close);
+
+            box = new TextBox();
+            box.BorderStyle = BorderStyle.None;
+            box.BackColor = Color.FromArgb(255, 28, 35, 56);
+            box.ForeColor = Color.White;
+            box.Font = new Font("Microsoft YaHei UI", 16f);
+            box.Bounds = new Rectangle(Width / 2 - 360, 60, 720, 48);
+            box.TextChanged += delegate { ApplyFilter(); };
+            Controls.Add(box);
+
+            status = new Label();
+            status.Text = "";
+            status.ForeColor = Color.FromArgb(140, 135, 155, 185);
+            status.Font = new Font("Microsoft YaHei UI", 9f);
+            status.AutoSize = true;
+            status.Location = new Point(Width / 2 - 360, 116);
+            Controls.Add(status);
+
+            scroll = new Panel();
+            scroll.Bounds = new Rectangle(28, 142, Width - 56, Height - 168);
+            scroll.AutoScroll = true;
+            Controls.Add(scroll);
+
+            canvas = new TileCanvas();
+            canvas.Location = new Point(0, 0);
+            scroll.Controls.Add(canvas);
+            canvas.ItemClicked += delegate(TileCanvas.TTile t) { Launch(t.Path, null); };
+
+            Paint += delegate(object s, PaintEventArgs e)
+            {
+                using (Pen p = new Pen(Color.FromArgb(80, 96, 210, 255), 1.3f))
+                    e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+                using (Pen p2 = new Pen(Color.FromArgb(60, 96, 150, 210), 1f))
+                    e.Graphics.DrawRectangle(p2, box.Left - 12, box.Top - 9, box.Width + 24, box.Height + 16);
+            };
+            Deactivate += delegate { Close(); };     // clicking outside closes
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) Close();
+                else if (e.KeyCode == Keys.Enter)
+                {
+                    TileCanvas.TTile t = canvas.FirstVisible();
+                    if (t != null) Launch(t.Path, null);
+                    e.Handled = true;
+                }
+            };
+
+            Shown += delegate
+            {
+                box.Focus();
+                status.Text = " 正在准备…";
+                ThreadPool.QueueUserWorkItem(delegate { Populate(); });
+            };
+        }
+
+        // fake acrylic: capture what is behind the window, blur, tint - marshalled
+        // to the UI thread (a cross-thread property set was crashing the app)
+        void BuildAcrylicBackground()
+        {
+            try
+            {
+                Image result = null;
+                using (Bitmap raw = new Bitmap(Width, Height))
+                {
+                    using (Graphics g = Graphics.FromImage(raw))
+                        g.CopyFromScreen(Left, Top, 0, 0, raw.Size);
+                    int sw = Math.Max(1, Width / 10), sh = Math.Max(1, Height / 10);
+                    using (Bitmap small = new Bitmap(raw, sw, sh))
+                    {
+                        for (int i = 0; i < 3; i++) BoxBlur(small);
+                        using (Bitmap bg = new Bitmap(small, Width, Height))
+                        using (Graphics g = Graphics.FromImage(bg))
+                        {
+                            using (SolidBrush tint = new SolidBrush(Color.FromArgb(178, 14, 18, 32)))
+                                g.FillRectangle(tint, 0, 0, Width, Height);
+                            result = (Image)bg.Clone();
+                        }
+                    }
+                }
+                if (result != null)
+                    SafeInvoke(delegate { if (!IsDisposed) { Image old = BackgroundImage; BackgroundImage = result; if (old != null) old.Dispose(); } Invalidate(); });
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] acrylic fail " + ex.Message); }
+        }
+
+        internal static void BoxBlur(Bitmap b)
+        {
+            try
+            {
+                Rectangle r = new Rectangle(0, 0, b.Width, b.Height);
+                BitmapData d = b.LockBits(r, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+                int w = b.Width, h = b.Height, stride = d.Stride;
+                byte[] px = new byte[stride * h];
+                Marshal.Copy(d.Scan0, px, 0, px.Length);
+                byte[] tmp = new byte[px.Length];
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    bool horiz = pass == 0;
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++)
+                        {
+                            int a = 0, rr = 0, gg = 0, bb = 0, n = 0;
+                            for (int k = -1; k <= 1; k++)
+                            {
+                                int xx = horiz ? x + k : x, yy = horiz ? y : y + k;
+                                if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+                                int i = yy * stride + xx * 4;
+                                a += px[i]; rr += px[i + 1]; gg += px[i + 2]; bb += px[i + 3]; n++;
+                            }
+                            int o = y * stride + x * 4;
+                            tmp[o] = (byte)(a / n); tmp[o + 1] = (byte)(rr / n);
+                            tmp[o + 2] = (byte)(gg / n); tmp[o + 3] = (byte)(bb / n);
+                        }
+                    byte[] swap = px; px = tmp; tmp = swap;
+                }
+                Marshal.Copy(px, 0, d.Scan0, px.Length);
+                b.UnlockBits(d);
+            }
+            catch { }
+        }
+
+        void Launch(string path, string arg)
+        {
+            RecordRecent(path);
+            try
+            {
+                if (arg != null) Process.Start(path, arg);
+                else Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] start fail " + ex.Message); }
+            Close();
+        }
+
+        void ApplyFilter()
+        {
+            if (canvas == null) return;
+            canvas.Refilter(scroll.ClientSize.Width, box.Text);
+            int n = canvas.VisibleCount;
+            status.Text = (box.Text == null || box.Text.Trim().Length == 0) ? "" : (" " + n + " 个匹配 - 回车启动第一个");
+        }
+
+        void SafeInvoke(MethodInvoker d)
+        {
+            try { if (!IsDisposed && !Disposing) BeginInvoke(d); }
+            catch { }
+        }
+
+        void Populate()
+        {
+            try
+            {
+                BuildAcrylicBackground();
+                List<AppCache.CacheTile> cached = null;
+                for (int wait = 0; wait < 30; wait++)
+                {
+                    cached = AppCache.Snapshot();
+                    if (cached != null) break;
+                    Thread.Sleep(300);
+                }
+                if (cached == null) { SafeInvoke(delegate { status.Text = " 索引不可用"; }); return; }
+
+                // recents first
+                List<AppCache.CacheTile> rec = new List<AppCache.CacheTile>();
+                lock (recLock)
+                {
+                    LoadRecents();
+                    List<KeyValuePair<string, long[]>> order = new List<KeyValuePair<string, long[]>>(recents);
+                    order.Sort(delegate(KeyValuePair<string, long[]> a, KeyValuePair<string, long[]> b)
+                    {
+                        return Score(b.Value).CompareTo(Score(a.Value));
+                    });
+                    foreach (KeyValuePair<string, long[]> kv in order)
+                    {
+                        if (rec.Count >= 12) break;
+                        foreach (AppCache.CacheTile c in cached)
+                            if (c.Path.ToLower() == kv.Key) { rec.Add(c); break; }
+                    }
+                }
+                Dictionary<string, List<AppCache.CacheTile>> cats = new Dictionary<string, List<AppCache.CacheTile>>();
+                foreach (AppCache.CacheTile c in cached)
+                {
+                    if (rec.Contains(c)) continue;
+                    List<AppCache.CacheTile> l;
+                    if (!cats.TryGetValue(c.Cat, out l)) { l = new List<AppCache.CacheTile>(); cats[c.Cat] = l; }
+                    l.Add(c);
+                }
+                List<string> keys = new List<string>(cats.Keys);
+                keys.Sort(delegate(string a, string b)
+                {
+                    if (a == "其他" && b != "其他") return 1;
+                    if (b == "其他" && a != "其他") return -1;
+                    return string.Compare(a, b, StringComparison.CurrentCulture);
+                });
+
+                SafeInvoke(delegate
+                {
+                    if (IsDisposed) return;
+                    try
+                    {
+                        canvas.SuspendLayout();
+                        canvas.Sections.Clear();
+                        if (rec.Count > 0)
+                        {
+                            TileCanvas.TSec s = canvas.NewSection("最近使用", Color.FromArgb(255, 110, 205, 255));
+                            foreach (AppCache.CacheTile c in rec) s.Items.Add(TileCanvas.Mk(c.Name, c.Path, c.Icon, null));
+                        }
+                        foreach (string k in keys)
+                        {
+                            TileCanvas.TSec s = canvas.NewSection(k, Color.FromArgb(200, 150, 175, 215));
+                            foreach (AppCache.CacheTile c in cats[k]) s.Items.Add(TileCanvas.Mk(c.Name, c.Path, c.Icon, null));
+                        }
+                        canvas.ResumeLayout(false);
+                        canvas.Finish(scroll.ClientSize.Width);
+                        status.Text = "";
+                        ApplyFilter();
+                    }
+                    catch (Exception ex) { Program.Log("[LAUNCH] build fail " + ex.Message); }
+                });
+            }
+            catch (Exception ex) { Program.Log("[LAUNCH] populate fail " + ex.Message); }
+        }
+
+        static double Score(long[] e)
+        {
+            double hours = (DateTime.Now.Ticks - e[0]) / 36000000000.0;
+            return e[1] * 2.0 - hours * 0.05;
+        }
+    }
+

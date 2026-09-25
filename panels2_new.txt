@@ -1,0 +1,243 @@
+    // ============ 桌面 panel: the Windows desktop, organized ============
+    class DesktopForm : Form
+    {
+        TextBox box;
+        Panel scroll;
+        TileCanvas canvas;
+        Label status;
+
+        public static void ShowDesk()
+        {
+            try
+            {
+                DesktopForm f = new DesktopForm();
+                f.Show();
+                f.Activate();
+            }
+            catch (Exception ex) { Program.Log("[DESK] open fail " + ex.Message); }
+        }
+
+        public DesktopForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            KeyPreview = true;
+            Rectangle sc = Screen.PrimaryScreen.Bounds;
+            int m = Math.Max(8, sc.Height / 40);
+            Bounds = new Rectangle(m, m, sc.Width - 2 * m, sc.Height - 2 * m);
+            BackColor = Color.FromArgb(16, 21, 36);
+            DoubleBuffered = true;
+
+            Label title = new Label();
+            title.Text = "桌面";
+            title.ForeColor = Color.FromArgb(165, 150, 180, 215);
+            title.Font = new Font("Microsoft YaHei UI", 11f);
+            title.AutoSize = true;
+            title.Location = new Point(34, 26);
+            Controls.Add(title);
+
+            Label close = new Label();
+            close.Text = "✕  关闭";
+            close.ForeColor = Color.FromArgb(175, 155, 170, 195);
+            close.Font = new Font("Microsoft YaHei UI", 10f);
+            close.AutoSize = true;
+            close.Location = new Point(Width - 116, 26);
+            close.Cursor = Cursors.Hand;
+            close.Click += delegate { Close(); };
+            Controls.Add(close);
+
+            box = new TextBox();
+            box.BorderStyle = BorderStyle.None;
+            box.BackColor = Color.FromArgb(255, 28, 35, 56);
+            box.ForeColor = Color.White;
+            box.Font = new Font("Microsoft YaHei UI", 15f);
+            box.Bounds = new Rectangle(Width / 2 - 340, 58, 680, 46);
+            box.TextChanged += delegate { ApplyFilter(); };
+            Controls.Add(box);
+
+            status = new Label();
+            status.Text = " 正在读取桌面内容…";
+            status.ForeColor = Color.FromArgb(140, 135, 155, 185);
+            status.Font = new Font("Microsoft YaHei UI", 9f);
+            status.AutoSize = true;
+            status.Location = new Point(Width / 2 - 340, 112);
+            Controls.Add(status);
+
+            scroll = new Panel();
+            scroll.Bounds = new Rectangle(28, 138, Width - 56, Height - 164);
+            scroll.AutoScroll = true;
+            Controls.Add(scroll);
+
+            canvas = new TileCanvas();
+            canvas.Location = new Point(0, 0);
+            scroll.Controls.Add(canvas);
+            canvas.ItemClicked += delegate(TileCanvas.TTile t)
+            {
+                try
+                {
+                    string arg = t.Tag as string;
+                    if (arg != null) Process.Start("explorer.exe", arg);   // shell namespace
+                    else Process.Start(new ProcessStartInfo(t.Path) { UseShellExecute = true });
+                }
+                catch (Exception ex) { Program.Log("[DESK] open item fail " + ex.Message); }
+                Close();
+            };
+
+            Paint += delegate(object s, PaintEventArgs e)
+            {
+                using (Pen p = new Pen(Color.FromArgb(80, 96, 210, 255), 1.3f))
+                    e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+                using (Pen p2 = new Pen(Color.FromArgb(60, 96, 150, 210), 1f))
+                    e.Graphics.DrawRectangle(p2, box.Left - 12, box.Top - 9, box.Width + 24, box.Height + 16);
+            };
+            Deactivate += delegate { Close(); };
+            KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
+
+            Shown += delegate
+            {
+                box.Focus();
+                ThreadPool.QueueUserWorkItem(delegate { Populate(); });
+            };
+        }
+
+        void BuildAcrylicBackground()
+        {
+            try
+            {
+                Image result = null;
+                using (Bitmap raw = new Bitmap(Width, Height))
+                {
+                    using (Graphics g = Graphics.FromImage(raw))
+                        g.CopyFromScreen(Left, Top, 0, 0, raw.Size);
+                    int sw = Math.Max(1, Width / 10), sh = Math.Max(1, Height / 10);
+                    using (Bitmap small = new Bitmap(raw, sw, sh))
+                    {
+                        for (int i = 0; i < 3; i++) LauncherForm.BoxBlur(small);
+                        using (Bitmap bg = new Bitmap(small, Width, Height))
+                        using (Graphics g = Graphics.FromImage(bg))
+                        {
+                            using (SolidBrush tint = new SolidBrush(Color.FromArgb(178, 14, 18, 32)))
+                                g.FillRectangle(tint, 0, 0, Width, Height);
+                            result = (Image)bg.Clone();
+                        }
+                    }
+                }
+                if (result != null)
+                    SafeInvoke(delegate { if (!IsDisposed) { Image old = BackgroundImage; BackgroundImage = result; if (old != null) old.Dispose(); } Invalidate(); });
+            }
+            catch (Exception ex) { Program.Log("[DESK] acrylic fail " + ex.Message); }
+        }
+
+        void SafeInvoke(MethodInvoker d)
+        {
+            try { if (!IsDisposed && !Disposing) BeginInvoke(d); }
+            catch { }
+        }
+
+        void ApplyFilter()
+        {
+            if (canvas == null) return;
+            canvas.Refilter(scroll.ClientSize.Width, box.Text);
+        }
+
+        void Populate()
+        {
+            try
+            {
+                BuildAcrylicBackground();
+                List<TileCanvas.TTile> sys = new List<TileCanvas.TTile>();
+                sys.Add(MkSys("此电脑", "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", 0));
+                sys.Add(MkSys("回收站", "shell:::{645FF040-5081-101B-9F08-00AA002F954E}", 1));
+
+                HashSet<string> names = new HashSet<string>();
+                names.Add("此电脑"); names.Add("回收站");
+                List<TileCanvas.TTile> items = new List<TileCanvas.TTile>();
+                try { CollectDir(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), items, names); } catch { }
+                try { CollectDir(Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory), items, names); } catch { }
+
+                SafeInvoke(delegate
+                {
+                    if (IsDisposed) return;
+                    try
+                    {
+                        canvas.Sections.Clear();
+                        TileCanvas.TSec s1 = canvas.NewSection("系统", Color.FromArgb(255, 110, 205, 255));
+                        s1.Items.AddRange(sys.ToArray());
+                        TileCanvas.TSec s2 = canvas.NewSection("桌面内容", Color.FromArgb(200, 150, 175, 215));
+                        s2.Items.AddRange(items.ToArray());
+                        canvas.Finish(scroll.ClientSize.Width);
+                        status.Text = "";
+                        ApplyFilter();
+                    }
+                    catch (Exception ex) { Program.Log("[DESK] build fail " + ex.Message); }
+                });
+            }
+            catch (Exception ex) { Program.Log("[DESK] populate fail " + ex.Message); }
+        }
+
+        TileCanvas.TTile MkSys(string name, string shellArg, int glyph)
+        {
+            TileCanvas.TTile t = TileCanvas.Mk(name, "explorer.exe", DrawGlyph(glyph), shellArg);
+            return t;
+        }
+
+        void CollectDir(string dir, List<TileCanvas.TTile> into, HashSet<string> names)
+        {
+            foreach (string p in Directory.GetFileSystemEntries(dir))
+            {
+                string nm = Path.GetFileName(p);
+                if (nm.ToLower().EndsWith(".ini") || nm.StartsWith(".")) continue;
+                if (!names.Add(nm.ToLower())) continue;
+                Bitmap ic = AppCache.IconFor(p);
+                bool isDir = false;
+                try { isDir = Directory.Exists(p); } catch { }
+                if (ic == null && isDir) ic = DrawGlyph(2);
+                into.Add(TileCanvas.Mk(nm, p, ic, null));
+            }
+            into.Sort(delegate(TileCanvas.TTile a, TileCanvas.TTile b)
+            {
+                return string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase);
+            });
+        }
+
+        // 0=monitor(此电脑) 1=bin(回收站) 2=folder
+        static Bitmap DrawGlyph(int kind)
+        {
+            Bitmap b = new Bitmap(48, 48);
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                if (kind == 0)
+                {
+                    using (Pen p = new Pen(Color.FromArgb(235, 225, 238, 252), 2.6f))
+                    {
+                        g.DrawRectangle(p, 8, 8, 32, 22);
+                        g.DrawLine(p, 24, 30, 24, 36);
+                        g.DrawLine(p, 15, 38, 33, 38);
+                    }
+                }
+                else if (kind == 1)
+                {
+                    using (Pen p = new Pen(Color.FromArgb(160, 215, 235, 252), 2.6f))
+                    {
+                        g.DrawRectangle(p, 13, 12, 22, 5);
+                        g.DrawLine(p, 20, 9, 28, 9);
+                        g.DrawRectangle(p, 16, 17, 16, 22);
+                        g.DrawLine(p, 22, 21, 22, 34);
+                        g.DrawLine(p, 26, 21, 26, 34);
+                    }
+                }
+                else
+                {
+                    using (SolidBrush fb = new SolidBrush(Color.FromArgb(220, 90, 160, 235)))
+                        g.FillRectangle(fb, 7, 12, 34, 27);
+                    using (SolidBrush fb2 = new SolidBrush(Color.FromArgb(235, 120, 185, 250)))
+                        g.FillRectangle(fb2, 7, 8, 18, 8);
+                }
+            }
+            return b;
+        }
+    }
+
