@@ -1502,6 +1502,7 @@ namespace TechRain
         bool staticPublished;
         int wallN;
         double wallDrawSum, wallPresentSum, wallPresentMax, wallUpdSum;
+        int wallCycle = 50;   // adaptive wallpaper frame cycle (weak machines stretch it)
         Stopwatch sw = Stopwatch.StartNew();
         IntPtr parentHwnd = IntPtr.Zero;
         bool fullscreenPause = false;
@@ -1809,12 +1810,20 @@ namespace TechRain
                     if (t2 - t1 > wallPresentMax) wallPresentMax = t2 - t1;
                     if (wallN >= 90)
                     {
-                        Program.Log(string.Format("[WALLR] n={0} updAvg={1:F1}ms drawOnly={2:F1}ms presentAvg={3:F1}ms presentMax={4:F1}ms",
-                            wallN, wallUpdSum / wallN, (wallDrawSum - wallUpdSum) / wallN, wallPresentSum / wallN, wallPresentMax));
+                        double wallFrame = (wallDrawSum + wallPresentSum) / wallN;
+                        // weak-machine adaptation: stretch the wallpaper cycle so its
+                        // GDI duty cycle stays ~<=50% no matter how slow the renderer
+                        if (wallFrame > 30) wallCycle = 80;       // ~12fps
+                        else if (wallFrame > 20) wallCycle = 65;  // ~15fps
+                        else wallCycle = 50;                      // 20fps
+                        Program.Log(string.Format("[WALLR] n={0} updAvg={1:F1}ms drawOnly={2:F1}ms presentAvg={3:F1}ms presentMax={4:F1}ms cycle={5}ms",
+                            wallN, wallUpdSum / wallN, (wallDrawSum - wallUpdSum) / wallN, wallPresentSum / wallN, wallPresentMax, wallCycle));
                         wallN = 0; wallDrawSum = 0; wallUpdSum = 0; wallPresentSum = 0; wallPresentMax = 0;
                     }
                 }
-                int wait = (int)(50 - (rsw.Elapsed.TotalMilliseconds - now));   // ~20fps cap: leaves GDI headroom for the dock
+                // ADAPT for the target machine: if a full frame (draw+present) is
+                // expensive, stretch the cycle so the GDI lock gets air for the dock
+                int wait = (int)(wallCycle - (rsw.Elapsed.TotalMilliseconds - now));   // ~20fps cap: leaves GDI headroom for the dock
                 Thread.Sleep(wait < 1 ? 1 : wait);
             }
         }
@@ -2289,6 +2298,16 @@ namespace TechRain
                 double ms = (Stopwatch.GetTimestamp() - q0) * 1000.0 / Stopwatch.Frequency;
                 if (ms > peakMaxMs) peakMaxMs = ms;
                 peakN++; peakSumMs += ms;
+                // NEW-MACHINE self-heal: a meter created against a stale/early default
+                // endpoint (device ready after autostart, user switches device) reads
+                // zero forever. ~10s of straight zeros -> rebuild against the current
+                // default device. Between songs this costs one cheap COM activation.
+                if (p <= 0.0001f) { zeroStreak++; } else { zeroStreak = 0; }
+                if (zeroStreak > 300)
+                {
+                    meter = null; zeroStreak = 0;
+                    Program.Log("[VU] meter read zero for ~10s -> recreated (endpoint may have changed)");
+                }
                 if (peakN >= 120)
                 {
                     if (peakMaxMs > 5)
@@ -2300,7 +2319,7 @@ namespace TechRain
             }
             catch { meter = null; return 0f; }
         }
-        int peakN;
+        int peakN, zeroStreak;
         double peakSumMs, peakMaxMs;
 
         static object CreateMeter()
@@ -4620,6 +4639,8 @@ namespace TechRain
         TimeProc animProc;
         int animMmId;
         int renderInFlight;
+        int hbTick;                     // heartbeat tick counter (parity for slow mode)
+        volatile int dockSlowDiv = 1;   // 1 = full rate, 2 = half rate (weak machine)
         int profN;
         double profDrawSum, profPresentSum, profPresentMax, profWinStart;
         Timer housekeeping = new Timer();
@@ -4860,8 +4881,11 @@ namespace TechRain
                         }
                     }
                     Bitmap ic = null;
-                    if (target.Length > 0 && File.Exists(target)) ic = LoadBest(target);
-                    if (ic == null) ic = LoadBest(f);
+                    bool targetAlive = target.Length > 0 && File.Exists(target);
+                    if (targetAlive) ic = LoadBest(target);
+                    // a DEAD lnk's shell icon is a generic blank-file glyph that reads
+                    // as "unrendered" at dock size - the letter tile is far better
+                    if (ic == null && targetAlive) ic = LoadBest(f);
                     if (ic == null) ic = LetterTile(label);   // never render a blank tile
                     pinned.Add(new DockItem
                     {
@@ -5302,13 +5326,34 @@ namespace TechRain
         static string ResolveDeadLnk(string label)
         {
             if (string.IsNullOrEmpty(label)) return null;
-            string lnk = FindStartMenuLnk(label);
-            if (lnk != null)
+            // try the dock label plus its known exe aliases ("网易云音乐" -> cloudmusic)
+            List<string> cands = new List<string>();
+            cands.Add(label);
+            string[] al;
+            if (Alias.TryGetValue(label, out al)) cands.AddRange(al);
+            foreach (string cand in cands)
             {
-                string t = ResolveLnk(lnk);
-                if (t.Length > 0 && File.Exists(t)) return t;
+                string lnk = FindStartMenuLnk(cand);
+                if (lnk != null)
+                {
+                    string t = ResolveLnk(lnk);
+                    if (t.Length > 0 && File.Exists(t)) return t;
+                }
+                string ap = AppPathsLookup(cand);
+                if (ap != null) return ap;
             }
-            return AppPathsLookup(label);
+            // fuzzy pass: any start-menu lnk whose name contains the label (or vice versa)
+            foreach (string cand in cands)
+            {
+                if (cand.Length < 2) continue;
+                string lnk = FindStartMenuLnkFuzzy(cand);
+                if (lnk != null)
+                {
+                    string t = ResolveLnk(lnk);
+                    if (t.Length > 0 && File.Exists(t)) return t;
+                }
+            }
+            return null;
         }
 
         static string FindStartMenuLnk(string label)
@@ -5322,21 +5367,42 @@ namespace TechRain
             foreach (string root in roots)
             {
                 if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
-                string hit = ScanLnkDir(root, want);
+                string hit = ScanLnkDir(root, want, false);
                 if (hit != null) return hit;
             }
             return null;
         }
 
-        static string ScanLnkDir(string dir, string want)
+        static string FindStartMenuLnkFuzzy(string label)
+        {
+            string[] roots =
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs")
+            };
+            foreach (string root in roots)
+            {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+                string hit = ScanLnkDir(root, label, true);
+                if (hit != null) return hit;
+            }
+            return null;
+        }
+
+        static string ScanLnkDir(string dir, string want, bool fuzzy)
         {
             try
             {
                 foreach (string f in Directory.GetFiles(dir, "*.lnk"))
-                    if (string.Equals(Path.GetFileName(f), want, StringComparison.OrdinalIgnoreCase)) return f;
+                {
+                    string fn = Path.GetFileNameWithoutExtension(f);
+                    if (string.Equals(fn, want, StringComparison.OrdinalIgnoreCase)) return f;
+                    if (fuzzy && (fn.IndexOf(want, StringComparison.OrdinalIgnoreCase) >= 0
+                               || want.IndexOf(fn, StringComparison.OrdinalIgnoreCase) >= 0)) return f;
+                }
                 foreach (string d in Directory.GetDirectories(dir))
                 {
-                    string hit = ScanLnkDir(d, want);
+                    string hit = ScanLnkDir(d, want, fuzzy);
                     if (hit != null) return hit;
                 }
             }
@@ -5530,6 +5596,11 @@ namespace TechRain
         // backlog burst after any UI stall.
         void AnimHeartbeat(uint id, uint msg, IntPtr user, IntPtr dw1, IntPtr dw2)
         {
+            // adaptive half-rate on weak machines: when a dock frame costs more
+            // than ~12ms (see [DOCK] perf) the heartbeat skips every other tick -
+            // 30fps springs instead of 66, and the GDI lock gets air back
+            int tick = Interlocked.Increment(ref hbTick);
+            if (dockSlowDiv == 2 && (tick & 1) == 0) return;
             if (IsHandleCreated && Interlocked.Exchange(ref renderInFlight, 1) == 0)
             {
                 try
@@ -6483,6 +6554,18 @@ namespace TechRain
                 // the chooser on the FIRST click (a picked hidden window restores).
                 // Visible windows first; hidden titled mains top the menu up when
                 // fewer than two are visible (fully tray-hidden state)
+                // DOCTRINE APPS FULLY TRAY-HIDDEN: the tray dance runs BEFORE the
+                // chooser. The chooser's picked-window restore is an external
+                // restore - on QQ/WeChat it surfaces an input-dead zombie (user:
+                // "说无数次了"). Visible-window states keep the chooser; only the
+                // fully-hidden state is routed straight to the tray.
+                if (pids.Count > 0 && !anyVis && trayDoctrine)
+                {
+                    Program.Log("[ACT] fully tray-hidden doctrine app -> tray dance (chooser skipped)");
+                    if (TraySurface(names, pids)) return;
+                    Program.Log("[ACT] tray dance failed -> falling through");
+                }
+
                 List<IntPtr> choosable = new List<IntPtr>();
                 HashSet<string> seenKeys = new HashSet<string>();
                 for (int pass = 0; pass < 2; pass++)   // pass 0: visible, pass 1: hidden top-up
@@ -7073,9 +7156,12 @@ namespace TechRain
             if (pPresent > profPresentMax) profPresentMax = pPresent;
             if (profN >= 60)
             {
-                Program.Log(string.Format("[DOCK] perf n={0} drawAvg={1:F1}ms presentAvg={2:F1}ms presentMax={3:F1}ms window={4:F1}s gc0={5} gc1={6} gc2={7}",
+                double avgFrame = (profDrawSum + profPresentSum) / profN;
+                // ADAPT for the target machine: weak GDI machines halve the dock rate
+                dockSlowDiv = avgFrame > 12.0 ? 2 : 1;
+                Program.Log(string.Format("[DOCK] perf n={0} drawAvg={1:F1}ms presentAvg={2:F1}ms presentMax={3:F1}ms window={4:F1}s gc0={5} gc1={6} gc2={7} slowDiv={8}",
                     profN, profDrawSum / profN, profPresentSum / profN, profPresentMax, sw.Elapsed.TotalSeconds - profWinStart,
-                    GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2)));
+                    GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2), dockSlowDiv));
                 profN = 0; profDrawSum = 0; profPresentSum = 0; profPresentMax = 0; profWinStart = sw.Elapsed.TotalSeconds;
             }
         }
